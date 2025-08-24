@@ -1,22 +1,59 @@
+def deployOne(String label, String port) {
+  bat """
+    @echo off
+    setlocal ENABLEDELAYEDEXPANSION
+
+    echo [${label}] Arrancando app en puerto ${port} contra DB %DB_NAME%
+
+    rem Construir URL JDBC SIN carets (^)
+    set "JDBC_URL=jdbc:mysql://%DB_HOST%:%DB_PORT%/%DB_NAME%?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC"
+
+    rem Lanzar la app en background
+    start "" /B cmd /c ^
+      java ^
+        -Dspring.datasource.url="!JDBC_URL!" ^
+        -Dspring.datasource.username=%DB_USER% ^
+        -Dspring.datasource.password=%DB_PASS% ^
+        -Dspring.jpa.hibernate.ddl-auto=update ^
+        -Dserver.port=${port} ^
+        -jar "${env.RELEASE_JAR}"
+
+    set "PID="
+
+    rem Espera hasta 120s a que el puerto esté LISTENING (1s por ciclo usando ping)
+    for /L %%i in (1,1,120) do (
+      ping -n 2 127.0.0.1 >nul
+      for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":${port} " ^| findstr LISTENING') do set "PID=%%a"
+      if defined PID goto up_${label}
+    )
+
+    echo [${label}] No abrio el puerto ${port} a tiempo.
+    rem Limpieza defensiva
+    for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":${port} " ^| findstr LISTENING') do taskkill /PID %%a /F >nul 2>&1
+    endlocal
+    exit /b 2
+
+    :up_${label}
+    echo [${label}] UP con PID !PID! en puerto ${port}. Apagando...
+    taskkill /PID !PID! /F >nul 2>&1
+    endlocal
+    exit /b 0
+  """
+}
+
 pipeline {
   agent any
-  options {
-    timestamps()
-    // Si quieres que al fallar una rama se cancelen las demás, descomenta:
-    // parallelsAlwaysFailFast()
-  }
+  options { timestamps() }
 
   environment {
-    // DB única para los 3 ambientes
-    DB_HOST = '127.0.0.1'
+    // MISMA DB para DEV/QA/PROD
+    DB_HOST = 'localhost'
     DB_PORT = '3306'
-    DB_NAME = 'blog'     // <<-- misma DB para DEV/QA/PROD
+    DB_NAME = 'blog'
     DB_USER = 'root'
     DB_PASS = 'root'
 
-    APP_PROFILE = ''     // usa 'prod' si manejas perfiles
-
-    // Puertos por ambiente (distintos, pero misma DB)
+    // Puertos distintos por ambiente
     DEV_PORT  = '8081'
     QA_PORT   = '8082'
     PROD_PORT = '8083'
@@ -29,24 +66,20 @@ pipeline {
       }
     }
 
-    stage('Build (sin tests)') {
+    stage('Build') {
       steps {
         bat '.\\mvnw.cmd -B clean package -Dmaven.test.skip=true'
       }
     }
 
-    stage('Prepare (artefacto & git)') {
+    stage('Stamp & Archive') {
       steps {
         script {
-          // Detectar JAR construido
           def listOut = bat(returnStdout: true, script: '@echo off\r\ndir /b target\\*.jar').trim()
           def jarLines = listOut.readLines()
-          if (!jarLines || jarLines.isEmpty()) {
-            error 'No se encontró ningún JAR en target/*.jar'
-          }
+          if (!jarLines || jarLines.isEmpty()) { error 'No se encontró ningún JAR en target/*.jar' }
           env.JAR_PATH = ("target\\" + jarLines[0].trim())
 
-          // SHA corto para nombre
           def shaOut = bat(returnStdout: true, script: '@echo off\r\ngit rev-parse --short=12 HEAD').trim()
           def lines = shaOut.readLines()
           env.GIT_SHA = lines[lines.size() - 1].trim()
@@ -54,11 +87,7 @@ pipeline {
           env.BUILD_NAME  = "blog-back-${env.BUILD_NUMBER}-${env.GIT_SHA}.jar"
           env.RELEASE_JAR = "target\\${env.BUILD_NAME}"
         }
-      }
-    }
 
-    stage('Stamp & Archive') {
-      steps {
         bat """
           copy /Y "${env.JAR_PATH}" "${env.RELEASE_JAR}"
           certutil -hashfile "${env.RELEASE_JAR}" SHA256 > "${env.RELEASE_JAR}.sha256.txt"
@@ -67,74 +96,18 @@ pipeline {
       }
     }
 
-    // -------- Deploy paralelo: misma DB, distintos puertos --------
     stage('Deploy DEV/QA/PROD (parallel)') {
       parallel {
-        stage('Deploy DEV (smoke)') {
-          steps {
-            catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
-              timeout(time: 40, unit: 'SECONDS') {
-                withEnv(["ENV_PORT=${DEV_PORT}"]) {
-                  bat """
-                    echo [DEV] Ejecutando: ${env.RELEASE_JAR} en puerto %ENV_PORT% con DB %DB_NAME%
-                    java -jar "${env.RELEASE_JAR}" ^
-                      --spring.datasource.url="jdbc:mysql://%DB_HOST%:%DB_PORT%/%DB_NAME%?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC" ^
-                      --spring.datasource.username=%DB_USER% ^
-                      --spring.datasource.password=%DB_PASS% ^
-                      --spring.jpa.hibernate.ddl-auto=update ^
-                      --server.port=%ENV_PORT%
-                  """
-                }
-              }
-            }
-          }
-        }
-
-        stage('Deploy QA (smoke)') {
-          steps {
-            catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
-              timeout(time: 40, unit: 'SECONDS') {
-                withEnv(["ENV_PORT=${QA_PORT}"]) {
-                  bat """
-                    echo [QA] Ejecutando: ${env.RELEASE_JAR} en puerto %ENV_PORT% con DB %DB_NAME%
-                    java -jar "${env.RELEASE_JAR}" ^
-                      --spring.datasource.url="jdbc:mysql://%DB_HOST%:%DB_PORT%/%DB_NAME%?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC" ^
-                      --spring.datasource.username=%DB_USER% ^
-                      --spring.datasource.password=%DB_PASS% ^
-                      --spring.jpa.hibernate.ddl-auto=update ^
-                      --server.port=%ENV_PORT%
-                  """
-                }
-              }
-            }
-          }
-        }
-
-        stage('Deploy PROD (smoke)') {
-          steps {
-            // PROD: si falla, que falle el pipeline
-            timeout(time: 40, unit: 'SECONDS') {
-              withEnv(["ENV_PORT=${PROD_PORT}"]) {
-                bat """
-                  echo [PROD] Ejecutando: ${env.RELEASE_JAR} en puerto %ENV_PORT% con DB %DB_NAME%
-                  java -jar "${env.RELEASE_JAR}" ^
-                    --spring.datasource.url="jdbc:mysql://%DB_HOST%:%DB_PORT%/%DB_NAME%?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC" ^
-                    --spring.datasource.username=%DB_USER% ^
-                    --spring.datasource.password=%DB_PASS% ^
-                    --spring.jpa.hibernate.ddl-auto=update ^
-                    --server.port=%ENV_PORT%
-                """
-              }
-            }
-          }
-        }
+        stage('Deploy DEV')  { steps { script { deployOne('DEV',  env.DEV_PORT)  } } }
+        stage('Deploy QA')   { steps { script { deployOne('QA',   env.QA_PORT)   } } }
+        stage('Deploy PROD') { steps { script { deployOne('PROD', env.PROD_PORT) } } }
       }
     }
   }
 
   post {
     always {
-      echo "Artefactos listos en 'Artifacts'. DEV/QA/PROD desplegados en paralelo usando la MISMA DB."
+      echo "Artefactos listos. DEV/QA/PROD verificados en paralelo contra la MISMA DB: ${env.DB_NAME}."
     }
   }
 }
