@@ -122,12 +122,30 @@ type "blog-back-<BUILD>-<GITSHA>.jar.sha256.txt"
 
 Para ejecutar:
 
-java -jar ./blog-back-<BUILD>-<GITSHA>.jar \
-  --spring.datasource.url='jdbc:mysql://localhost:3306/blog?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC' \
-  --spring.datasource.username=root \
-  --spring.datasource.password=root \
-  --spring.jpa.hibernate.ddl-auto=update \
-  --server.port=8081
+cmd windows:
+
+set JAR=blog-back-5-b7e4f675aa95.jar
+set URL=jdbc:mysql://localhost:3306/blog?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+set USER=root
+set PASS=root
+
+rem 
+start "DEV"  cmd /c java -jar "%JAR%" --server.port=8081 --spring.datasource.url="%URL%" --spring.datasource.username=%USER% --spring.datasource.password=%PASS% --spring.jpa.hibernate.ddl-auto=update
+start "QA"   cmd /c java -jar "%JAR%" --server.port=8082 --spring.datasource.url="%URL%" --spring.datasource.username=%USER% --spring.datasource.password=%PASS% --spring.jpa.hibernate.ddl-auto=update
+start "PROD" cmd /c java -jar "%JAR%" --server.port=8083 --spring.datasource.url="%URL%" --spring.datasource.username=%USER% --spring.datasource.password=%PASS% --spring.jpa.hibernate.ddl-auto=update
+
+
+linux:
+
+JAR=blog-back-5-b7e4f675aa95.jar
+URL='jdbc:mysql://localhost:3306/blog?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC'
+USER=root
+PASS=root
+
+nohup java -jar "$JAR" --server.port=8081 --spring.datasource.url="$URL" --spring.datasource.username=$USER --spring.datasource.password=$PASS --spring.jpa.hibernate.ddl-auto=update > dev.log 2>&1 &
+nohup java -jar "$JAR" --server.port=8082 --spring.datasource.url="$URL" --spring.datasource.username=$USER --spring.datasource.password=$PASS --spring.jpa.hibernate.ddl-auto=update > qa.log 2>&1 &
+nohup java -jar "$JAR" --server.port=8083 --spring.datasource.url="$URL" --spring.datasource.username=$USER --spring.datasource.password=$PASS --spring.jpa.hibernate.ddl-auto=update > prod.log 2>&1 &
+
 
 ## 👥 Equipo
 

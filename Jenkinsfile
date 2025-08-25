@@ -1,14 +1,62 @@
+def deployOne(String label, String port) {
+  bat """
+    @echo off
+    setlocal ENABLEDELAYEDEXPANSION
+
+    echo [${label}] Arrancando app en puerto ${port} contra DB %DB_NAME%
+
+    rem Construir URL JDBC SIN carets (^)
+    set "JDBC_URL=jdbc:mysql://%DB_HOST%:%DB_PORT%/%DB_NAME%?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC"
+
+    rem Lanzar la app en background
+    start "" /B cmd /c ^
+      java ^
+        -Dspring.datasource.url="!JDBC_URL!" ^
+        -Dspring.datasource.username=%DB_USER% ^
+        -Dspring.datasource.password=%DB_PASS% ^
+        -Dspring.jpa.hibernate.ddl-auto=update ^
+        -Dserver.port=${port} ^
+        -jar "${env.RELEASE_JAR}"
+
+    set "PID="
+
+    rem Espera hasta 120s a que el puerto esté LISTENING (1s por ciclo usando ping)
+    for /L %%i in (1,1,120) do (
+      ping -n 2 127.0.0.1 >nul
+      for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":${port} " ^| findstr LISTENING') do set "PID=%%a"
+      if defined PID goto up_${label}
+    )
+
+    echo [${label}] No abrio el puerto ${port} a tiempo.
+    rem Limpieza defensiva
+    for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":${port} " ^| findstr LISTENING') do taskkill /PID %%a /F >nul 2>&1
+    endlocal
+    exit /b 2
+
+    :up_${label}
+    echo [${label}] UP con PID !PID! en puerto ${port}. Apagando...
+    taskkill /PID !PID! /F >nul 2>&1
+    endlocal
+    exit /b 0
+  """
+}
+
 pipeline {
   agent any
   options { timestamps() }
 
   environment {
+    // MISMA DB para DEV/QA/PROD
     DB_HOST = 'localhost'
     DB_PORT = '3306'
-    DB_NAME = 'blog'      
-    DB_USER = 'root'      
-    DB_PASS = 'root'    
-    APP_PROFILE = ''
+    DB_NAME = 'blog'
+    DB_USER = 'root'
+    DB_PASS = 'root'
+
+    // Puertos distintos por ambiente
+    DEV_PORT  = '8081'
+    QA_PORT   = '8082'
+    PROD_PORT = '8083'
   }
 
   stages {
@@ -18,9 +66,8 @@ pipeline {
       }
     }
 
-    stage('Build (sin tests)') {
+    stage('Build') {
       steps {
-        // Build “prod-like” sin compilar/ejecutar tests
         bat '.\\mvnw.cmd -B clean package -Dmaven.test.skip=true'
       }
     }
@@ -28,62 +75,41 @@ pipeline {
     stage('Stamp & Archive') {
       steps {
         script {
-          // 1) Detectar el JAR generado (sin plugins extra)
           def listOut = bat(returnStdout: true, script: '@echo off\r\ndir /b target\\*.jar').trim()
           def jarLines = listOut.readLines()
-          if (jarLines == null || jarLines.isEmpty()) {
-            error 'No se encontró ningún JAR en target/*.jar'
-          }
+          if (!jarLines || jarLines.isEmpty()) { error 'No se encontró ningún JAR en target/*.jar' }
           env.JAR_PATH = ("target\\" + jarLines[0].trim())
 
-          // 2) Obtener GIT_SHA limpio (última línea)
           def shaOut = bat(returnStdout: true, script: '@echo off\r\ngit rev-parse --short=12 HEAD').trim()
           def lines = shaOut.readLines()
           env.GIT_SHA = lines[lines.size() - 1].trim()
 
-          // 3) Nombre final del artefacto
-          env.BUILD_NAME = "blog-back-${env.BUILD_NUMBER}-${env.GIT_SHA}.jar"
+          env.BUILD_NAME  = "blog-back-${env.BUILD_NUMBER}-${env.GIT_SHA}.jar"
+          env.RELEASE_JAR = "target\\${env.BUILD_NAME}"
         }
 
-        // 4) Copiar y generar checksum con rutas entre comillas
         bat """
-          copy /Y "${env.JAR_PATH}" "target\\${env.BUILD_NAME}"
-          certutil -hashfile "target\\${env.BUILD_NAME}" SHA256 > "target\\${env.BUILD_NAME}.sha256.txt"
+          copy /Y "${env.JAR_PATH}" "${env.RELEASE_JAR}"
+          certutil -hashfile "${env.RELEASE_JAR}" SHA256 > "${env.RELEASE_JAR}.sha256.txt"
         """
-
-        // 5) Publicar artefactos
         archiveArtifacts artifacts: "target/${env.BUILD_NAME}, target/${env.BUILD_NAME}.sha256.txt", fingerprint: true
       }
     }
 
-    stage('Smoke run (MySQL local)') {
-      steps {
-        // Limitamos con timeout y no rompemos el build si expira (queda UNSTABLE).
-        catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
-          timeout(time: 40, unit: 'SECONDS') {
-            withEnv([
-              "SPRING_PROFILES_ACTIVE=${APP_PROFILE}",
-              "SPRING_DATASOURCE_URL=jdbc:mysql://${DB_HOST}:${DB_PORT}/${DB_NAME}?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC",
-              "SPRING_DATASOURCE_USERNAME=${DB_USER}",
-              "SPRING_DATASOURCE_PASSWORD=${DB_PASS}",
-              // Cambia a 'none' si NO quieres que toque el esquema en tu máquina
-              "SPRING_JPA_HIBERNATE_DDL_AUTO=update"
-            ]) {
-              bat """
-                for %%f in (target\\*.jar) do ( set "APP_JAR=%%f" )
-                echo Ejecutando: %APP_JAR%
-                java -jar "%APP_JAR%"
-              """
-            }
-          }
-        }
+    stage('Deploy DEV/QA/PROD (parallel)') {
+      parallel {
+        stage('Deploy DEV')  { steps { script { deployOne('DEV',  env.DEV_PORT)  } } }
+        stage('Deploy QA')   { steps { script { deployOne('QA',   env.QA_PORT)   } } }
+        stage('Deploy PROD') { steps { script { deployOne('PROD', env.PROD_PORT) } } }
       }
     }
   }
 
   post {
     always {
-      echo "Listo. Artefactos en 'Artifacts'. Si el smoke marcó UNSTABLE es por timeout intencional."
+      echo "Artefactos listos. DEV/QA/PROD verificados en paralelo contra la MISMA DB: ${env.DB_NAME}."
     }
   }
 }
+
+
