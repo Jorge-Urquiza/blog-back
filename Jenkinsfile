@@ -50,7 +50,7 @@ pipeline {
     DB_HOST = 'localhost'
     DB_PORT = '3306'
     DB_NAME = 'blog'
-    DB_USER = 'user'
+    DB_USER = 'root'
     DB_PASS = 'root'
 
     // Puertos distintos por ambiente
@@ -111,4 +111,5 @@ pipeline {
     }
   }
 }
+
 
